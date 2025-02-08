@@ -70,8 +70,6 @@ def main():
     block_size = 128
     train_data = prepare_shakespeare_data_bpe("data/input.txt", block_size)
 
-    print(train_data)
-
     # 2) Construct GPT model
     vocab_size = train_data["vocab_size"]
     config = GPTConfig(
@@ -82,29 +80,19 @@ def main():
     # 3) Setup trainer config
     trainer_cfg = Trainer.get_default_config()
     trainer_cfg.block_size = block_size
-    trainer_cfg.max_iters = 10
+    trainer_cfg.max_iters = 50000
     trainer_cfg.batch_size = 64
     trainer_cfg.learning_rate = 3e-4
-
-    # 4) Create trainer
-    trainer = Trainer(trainer_cfg, model, train_data, params=None)
-
-    # 5) Run training loop
-    trainer.run()
-    print("Finished training, final loss:", float(trainer.loss))
 
     ckpt_dir = os.path.abspath("checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Save only the model parameters for inference:
-    checkpoints.save_checkpoint(
-        ckpt_dir=ckpt_dir,
-        target=trainer.state.params,  # now saving only the params
-        step=trainer.iter_num,
-        overwrite=True,
-    )
+    # 4) Create trainer
+    trainer = Trainer(trainer_cfg, model, train_data, params=None, ckpt_dir=ckpt_dir)
 
-    print(f"Checkpoint saved at step {trainer.iter_num}.")
+    # 5) Run training loop
+    trainer.run()
+    print("Finished training, final loss:", float(trainer.loss))
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ This is a direct rewrite of the PyTorch-based trainer to a Flax-based version.
 import time
 from collections import defaultdict
 from typing import Any, Dict, Callable
-
+from flax.training import checkpoints
 from tqdm import tqdm
 
 import jax
@@ -152,7 +152,10 @@ class Trainer:
         C.block_size = 128
         return C
 
-    def __init__(self, config: CfgNode, model, train_dataset, params=None):
+    def __init__(
+        self, config: CfgNode, model, train_dataset, params=None, ckpt_dir="checkpoints"
+    ):
+        self.ckpt_dir = ckpt_dir
         self.config = config
         self.model = model
 
@@ -223,3 +226,19 @@ class Trainer:
                 # Update tqdm progress bar
                 pbar.set_postfix({"loss": float(loss)})
                 pbar.update(1)
+
+                if self.iter_num % 1000 == 0:
+
+                    # Save only the model parameters for inference:
+                    checkpoints.save_checkpoint(
+                        ckpt_dir=self.ckpt_dir,
+                        target=self.state.params,  # now saving only the params
+                        step=self.iter_num,
+                        overwrite=True,
+                        keep_every_n_steps=1000,
+                    )
+
+                    print(f"Checkpoint saved at step {self.iter_num}.")
+
+                    with open("losses.txt", "a") as f:
+                        f.write(f"{self.iter_num},{loss}\n")
