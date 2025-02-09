@@ -80,7 +80,7 @@ def main():
     # 3) Setup trainer config
     trainer_cfg = Trainer.get_default_config()
     trainer_cfg.block_size = block_size
-    trainer_cfg.max_iters = 50000
+    trainer_cfg.max_iters = 100000
     trainer_cfg.batch_size = 64
     trainer_cfg.learning_rate = 3e-4
 
