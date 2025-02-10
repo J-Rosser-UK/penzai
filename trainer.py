@@ -13,10 +13,11 @@ import jax
 import jax.numpy as jnp
 import optax
 
+from utils import CfgNode, set_seed
+
 from flax.training import train_state
 from flax.core import FrozenDict
-
-from utils import CfgNode, set_seed
+from flax.jax_utils import unreplicate
 
 
 class TrainState(train_state.TrainState):
@@ -73,51 +74,44 @@ def create_train_state(
     return state
 
 
-import jax
-import jax.numpy as jnp
-import optax
-
-from flax.training import train_state
-from flax.core import FrozenDict
-
-
-def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray]):
-    """
-    Single training step: forward pass, compute loss, backprop via grad, apply updates.
-    Args:
-      state: the current TrainState (includes params, optimizer, rng, etc.)
-      batch: dict with "x" and "y" (token indices, targets).
-
-    Returns:
-      new_state: the updated TrainState
-      loss: the scalar loss
-    """
-
+def train_step(state: train_state.TrainState, batch: dict):
     def loss_fn(params):
-        # We pass the dropout rng explicitly as {'dropout': state.dropout_rng}
         logits, loss = state.apply_fn(
             {"params": params},
             batch["x"],
             targets=batch["y"],
-            deterministic=False,  # training mode
+            deterministic=False,
             rngs={"dropout": state.dropout_rng},
         )
-        return loss
+        return loss, logits
 
-    grad_fn = jax.value_and_grad(loss_fn)
-    loss, grads = grad_fn(state.params)
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, _), grads = grad_fn(state.params)
 
+    # Average gradients across devices.
+    grads = jax.lax.pmean(grads, axis_name="batch")
+
+    # Apply gradients.
     new_state = state.apply_gradients(grads=grads)
 
-    # Update dropout rng so next step is different
+    # Update dropout RNG for each device.
     new_dropout_rng, _ = jax.random.split(new_state.dropout_rng)
     new_state = new_state.replace(dropout_rng=new_dropout_rng)
 
+    # Average loss across devices.
+    loss = jax.lax.pmean(loss, axis_name="batch")
     return new_state, loss
 
 
-# Jit the train_step
-train_step_jitted = jax.jit(train_step)
+# Now create a pmapped version of train_step:
+train_step = jax.pmap(train_step, axis_name="batch")
+
+
+def shard(batch):
+    # Reshape each array from [global_batch, ...] to [n_devices, batch_per_device, ...]
+    return jax.tree_util.tree_map(
+        lambda x: x.reshape((jax.local_device_count(), -1) + x.shape[1:]), batch
+    )
 
 
 def infinite_random_sampler(
@@ -174,6 +168,8 @@ class Trainer:
 
         # Create the initial TrainState
         self.state = create_train_state(self.rng, model, config, params)
+        # Replicate state across devices:
+        self.state = jax.device_put_replicated(self.state, jax.devices())
 
         self.train_dataset = train_dataset
         self.callbacks = defaultdict(list)
@@ -184,7 +180,7 @@ class Trainer:
         self.iter_dt = 0.0
         self.loss = 0.0
 
-        print("Trainer initialized with JAX. Using device:", jax.devices()[0])
+        print("Trainer initialized with JAX. Using device:", jax.devices())
 
     def add_callback(self, onevent: str, callback: Callable):
         self.callbacks[onevent].append(callback)
@@ -203,7 +199,7 @@ class Trainer:
         if self.config.max_iters is None:
             raise ValueError("config.max_iters must be set to a finite integer")
 
-        # Prepare infinite sampler
+        # Prepare infinite sampler (unchanged)
         sampler_key, self.rng = jax.random.split(self.rng)
         data_iter = infinite_random_sampler(
             self.train_dataset, batch_size=self.config.batch_size, key=sampler_key
@@ -211,43 +207,36 @@ class Trainer:
 
         self.iter_time = time.time()
 
-        # Initialize tqdm progress bar
         with tqdm(total=self.config.max_iters, desc="Training", unit="batch") as pbar:
             for _ in range(self.config.max_iters):
-                # get next batch
                 batch = next(data_iter)
-                # move to device if needed
+                # Move batch to device memory
                 batch = jax.device_put(batch)
+                # Shard the batch across devices (e.g. 64 -> [8, 8, ...] for 8 devices)
+                batch = shard(batch)
 
-                # single training step
-                self.state, loss = train_step_jitted(self.state, batch)
-                self.loss = loss
+                # Run a training step on all devices in parallel
+                self.state, loss = train_step(self.state, batch)
 
-                # Trigger any callbacks
+                # For logging, you might want to take the loss from the first device:
+                self.loss = loss[0]
+
                 self.trigger_callbacks("on_batch_end")
-
-                # Logging and updating timing info
                 self.iter_num += 1
                 tnow = time.time()
                 self.iter_dt = tnow - self.iter_time
                 self.iter_time = tnow
 
-                # Update tqdm progress bar
-                pbar.set_postfix({"loss": float(loss)})
+                pbar.set_postfix({"loss": float(loss[0])})
                 pbar.update(1)
 
                 if self.iter_num % 1000 == 0:
-
-                    # Save only the model parameters for inference:
+                    # Extract a single replica’s parameters.
+                    cpu_params = jax.device_get(unreplicate(self.state.params))
                     checkpoints.save_checkpoint(
                         ckpt_dir=self.ckpt_dir,
-                        target=self.state.params,  # now saving only the params
+                        target=cpu_params,
                         step=self.iter_num,
                         overwrite=True,
                         keep_every_n_steps=1000,
                     )
-
-                    print(f"Checkpoint saved at step {self.iter_num}.")
-
-                    with open("losses.txt", "a") as f:
-                        f.write(f"{self.iter_num},{loss}\n")

@@ -10,6 +10,10 @@ from bpe import get_encoder
 from inference import load_model_params
 from flax.training import checkpoints
 
+import numpy as np
+import os
+from flax.training import checkpoints
+
 
 def prepare_data_bpe(path, block_size):
     """
@@ -68,7 +72,7 @@ def prepare_data_bpe(path, block_size):
 def main():
     # 1) Prepare data
     block_size = 256
-    train_data = prepare_data_bpe("data/small_wiki.txt", block_size)
+    train_data = prepare_data_bpe("data/input.txt", block_size)
     print(len(train_data))
 
     # 2) Construct GPT model

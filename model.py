@@ -26,6 +26,66 @@ from flax.linen import initializers
 from tqdm import tqdm
 
 
+import jax
+import jax.numpy as jnp
+
+_MAX_WAVELENGTH = 10000  # or however large you want
+
+import jax
+import jax.numpy as jnp
+
+_MAX_WAVELENGTH = 10000
+
+
+def apply_p_rope(
+    inputs: jnp.ndarray,  # [..., seq_len, head_dim]
+    positions: jnp.ndarray,  # [..., seq_len]
+    head_dim: int,
+    max_wavelength: int = _MAX_WAVELENGTH,
+    rope_percentage: float = 1.0,
+) -> jnp.ndarray:
+    """
+    Applies partial Rotary Positional Embeddings (p-RoPE) to `inputs`.
+
+    inputs:    shape = [..., seq_len, head_dim]
+    positions: shape = [..., seq_len]
+    """
+    # How many dimensions get the rotary transform:
+    rope_angles = int(rope_percentage * head_dim // 2)
+    # Remaining "no-rotation" dims:
+    nope_angles = head_dim // 2 - rope_angles
+
+    fraction = 2.0 * jnp.arange(0, rope_angles) / head_dim
+    timescale = max_wavelength**fraction
+
+    # Pad so leftover dims see "infinite" wavelength => effectively no rotation
+    timescale = jnp.pad(
+        timescale,
+        (0, nope_angles),
+        mode="constant",
+        constant_values=(0, jnp.inf),
+    )
+
+    # positions[..., None] => shape [..., seq_len, 1]
+    # timescale[None, :]   => shape [1, rotary_dims]
+    # => results in shape [..., seq_len, rotary_dims]
+    sinusoid_inp = positions[..., None] / timescale[None, :]
+
+    sin = jnp.sin(sinusoid_inp)  # [..., seq_len, d/2]
+    cos = jnp.cos(sinusoid_inp)  # [..., seq_len, d/2]
+
+    # Split the input along the last dimension
+    first_half, second_half = jnp.split(inputs, 2, axis=-1)
+    # Each half has shape [..., seq_len, head_dim/2]
+
+    # Standard RoPE transformation
+    first_part = first_half * cos - second_half * sin
+    second_part = second_half * cos + first_half * sin
+
+    out = jnp.concatenate([first_part, second_part], axis=-1)
+    return out.astype(inputs.dtype)
+
+
 class GPTConfig:
     def __init__(
         self,
@@ -57,6 +117,10 @@ def new_gelu(x: jnp.ndarray) -> jnp.ndarray:
 class CausalSelfAttention(nn.Module):
     config: GPTConfig
 
+    # Optional: keep rope config in GPTConfig if you want
+    # rope_percentage: float = 1.0
+    # max_wavelength: int = 10000
+
     def setup(self):
         assert self.config.n_embd % self.config.n_head == 0
         self.c_attn = nn.Dense(
@@ -73,30 +137,73 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(self.config.resid_pdrop)
         self.n_head = self.config.n_head
         self.n_embd = self.config.n_embd
+        # possibly read from config if you want rope_percentage, etc.
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = False) -> jnp.ndarray:
+        """
+        x: [B, T, C]
+        """
         B, T, C = x.shape
 
-        qkv = self.c_attn(x)
-        q, k, v = jnp.split(qkv, 3, axis=-1)
+        # Compute Q, K, V
+        qkv = self.c_attn(x)  # [B, T, 3*C]
+        q, k, v = jnp.split(qkv, 3, axis=-1)  # each [B, T, C]
 
         head_dim = C // self.n_head
+        # Reshape to [B, n_head, T, head_dim]
         q = q.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
         k = k.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
 
-        att = jnp.einsum("bhqd,bhkd->bhqk", q, k)
-        att = att * (1.0 / math.sqrt(k.shape[-1]))
+        # -----------------------
+        # Apply p-RoPE to Q, K
+        # -----------------------
+        # 1) Flatten (B, n_head) into one batch dimension
+        q_rope = q.reshape(B * self.n_head, T, head_dim)
+        k_rope = k.reshape(B * self.n_head, T, head_dim)
 
-        # Modified causal mask implementation
-        causal_mask = jnp.tril(jnp.ones((T, T)))
+        # 2) positions array: shape [B*n_head, T]
+        #    Here we simply repeat the [0..T-1] range for each of the B*n_head rows
+        positions = jnp.arange(T, dtype=q.dtype)[None, :].repeat(
+            B * self.n_head, axis=0
+        )
+
+        # 3) Actually call apply_p_rope
+        #    (you can parametrize rope_percentage or max_wavelength from config)
+        q_roped = apply_p_rope(
+            inputs=q_rope,
+            positions=positions,
+            head_dim=head_dim,
+            max_wavelength=10000,  # or from config
+            rope_percentage=1.0,  # or from config
+        )
+        k_roped = apply_p_rope(
+            inputs=k_rope,
+            positions=positions,
+            head_dim=head_dim,
+            max_wavelength=10000,
+            rope_percentage=1.0,
+        )
+
+        # 4) Reshape back to [B, n_head, T, head_dim]
+        q = q_roped.reshape(B, self.n_head, T, head_dim)
+        k = k_roped.reshape(B, self.n_head, T, head_dim)
+
+        # Perform attention: dot product q·k
+        att = jnp.einsum("bhqd,bhkd->bhqk", q, k)
+        att = att * (1.0 / jnp.sqrt(k.shape[-1]))
+
+        # Causal mask
+        causal_mask = jnp.tril(jnp.ones((T, T), dtype=bool))
         mask_value = jnp.finfo(att.dtype).min
         att = jnp.where(causal_mask, att, mask_value)
 
         att = nn.softmax(att, axis=-1)
         att = self.attn_dropout(att, deterministic=deterministic)
 
+        # Output
         y = jnp.einsum("bhqk,bhkd->bhqd", att, v)
+        # [B, n_head, T, head_dim] -> [B, T, n_head, head_dim] -> [B, T, C]
         y = y.transpose(0, 2, 1, 3).reshape(B, T, C)
 
         y = self.c_proj(y)
@@ -150,11 +257,11 @@ class GPT(nn.Module):
             features=self.config.n_embd,
             embedding_init=initializers.normal(stddev=0.02),
         )
-        self.wpe = nn.Embed(
-            num_embeddings=self.config.block_size,
-            features=self.config.n_embd,
-            embedding_init=initializers.normal(stddev=0.02),
-        )
+        # self.wpe = nn.Embed(
+        #     num_embeddings=self.config.block_size,
+        #     features=self.config.n_embd,
+        #     embedding_init=initializers.normal(stddev=0.02),
+        # )
         self.drop = nn.Dropout(self.config.embd_pdrop)
         self.h = [Block(self.config) for _ in range(self.config.n_layer)]
         self.ln_f = nn.LayerNorm(epsilon=1e-5)
@@ -171,22 +278,26 @@ class GPT(nn.Module):
         deterministic: bool = False,
     ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
         B, T = idx.shape
-        assert (
-            T <= self.config.block_size
-        ), f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        # validate
+        assert T <= self.config.block_size, (
+            f"Cannot forward sequence of length {T}, "
+            f"block size is only {self.config.block_size}"
+        )
 
-        pos = jnp.arange(T)[None, :]
+        # tokens -> embeddings
+        tok_emb = self.wte(idx)  # [B, T, n_embd]
 
-        tok_emb = self.wte(idx)
-        pos_emb = self.wpe(pos)
-        x = self.drop(tok_emb + pos_emb, deterministic=deterministic)
+        # NO additive pos_emb if using RoPE. So just:
+        x = self.drop(tok_emb, deterministic=deterministic)
 
+        # forward the Transformer blocks
         for block in self.h:
             x = block(x, deterministic=deterministic)
-        x = self.ln_f(x)
 
+        x = self.ln_f(x)
         logits = self.lm_head(x)
 
+        # optional loss
         loss = None
         if targets is not None:
             vocab_size = logits.shape[-1]
