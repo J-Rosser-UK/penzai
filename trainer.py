@@ -40,7 +40,7 @@ def create_train_state(
 
     # Example shape: (batch_size, sequence_length) for tokens
     # but for initialization, we often pass a dummy shape (B, T).
-    # Adjust as needed. Suppose block_size=128 for a dummy example:
+    # Adjust as needed. Suppose block_size=256 for a dummy example:
     dummy_input = jnp.zeros((1, config.block_size), dtype=jnp.int32)
 
     # Initialize params; model.__call__ expects (idx, targets=None, deterministic=False)
@@ -73,12 +73,20 @@ def create_train_state(
     return state
 
 
-def train_step(state: TrainState, batch: Dict[str, jnp.ndarray]):
+import jax
+import jax.numpy as jnp
+import optax
+
+from flax.training import train_state
+from flax.core import FrozenDict
+
+
+def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray]):
     """
     Single training step: forward pass, compute loss, backprop via grad, apply updates.
     Args:
       state: the current TrainState (includes params, optimizer, rng, etc.)
-      batch: dict with "x" and "y" (token indices, targets), or however you store it.
+      batch: dict with "x" and "y" (token indices, targets).
 
     Returns:
       new_state: the updated TrainState
@@ -96,19 +104,20 @@ def train_step(state: TrainState, batch: Dict[str, jnp.ndarray]):
         )
         return loss
 
-    # Compute gradients
     grad_fn = jax.value_and_grad(loss_fn)
     loss, grads = grad_fn(state.params)
 
-    # Update parameters
     new_state = state.apply_gradients(grads=grads)
 
     # Update dropout rng so next step is different
-    # We can split from the current dropout RNG to get the next one
     new_dropout_rng, _ = jax.random.split(new_state.dropout_rng)
     new_state = new_state.replace(dropout_rng=new_dropout_rng)
 
     return new_state, loss
+
+
+# Jit the train_step
+train_step_jitted = jax.jit(train_step)
 
 
 def infinite_random_sampler(
@@ -142,14 +151,14 @@ class Trainer:
         # data config
         C.num_workers = 4  # not strictly used here
         # optimizer parameters
-        C.max_iters = 1000  # make sure to set a finite number here
+        C.max_iters = 100000  # make sure to set a finite number here
         C.batch_size = 64
         C.learning_rate = 3e-4
         C.betas = (0.9, 0.95)
         C.weight_decay = 0.1
         C.grad_norm_clip = 1.0
         # block_size could be used for dummy init shape, etc.
-        C.block_size = 128
+        C.block_size = 256
         return C
 
     def __init__(
@@ -211,7 +220,7 @@ class Trainer:
                 batch = jax.device_put(batch)
 
                 # single training step
-                self.state, loss = train_step(self.state, batch)
+                self.state, loss = train_step_jitted(self.state, batch)
                 self.loss = loss
 
                 # Trigger any callbacks

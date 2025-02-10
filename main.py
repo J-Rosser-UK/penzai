@@ -11,7 +11,7 @@ from inference import load_model_params
 from flax.training import checkpoints
 
 
-def prepare_shakespeare_data_bpe(path, block_size):
+def prepare_data_bpe(path, block_size):
     """
     Read the entire corpus from `path`, tokenize it with the GPT-2 BPE tokenizer,
     then produce (x, y) training examples of length `block_size`.
@@ -67,8 +67,9 @@ def prepare_shakespeare_data_bpe(path, block_size):
 
 def main():
     # 1) Prepare data
-    block_size = 128
-    train_data = prepare_shakespeare_data_bpe("data/input.txt", block_size)
+    block_size = 256
+    train_data = prepare_data_bpe("data/small_wiki.txt", block_size)
+    print(len(train_data))
 
     # 2) Construct GPT model
     vocab_size = train_data["vocab_size"]
@@ -80,7 +81,7 @@ def main():
     # 3) Setup trainer config
     trainer_cfg = Trainer.get_default_config()
     trainer_cfg.block_size = block_size
-    trainer_cfg.max_iters = 100000
+    trainer_cfg.max_iters = 300000
     trainer_cfg.batch_size = 64
     trainer_cfg.learning_rate = 3e-4
 

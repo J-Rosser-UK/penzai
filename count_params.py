@@ -6,10 +6,10 @@ from model import GPT, GPTConfig
 # Define a sample configuration (modify these as needed)
 config = GPTConfig(
     vocab_size=50257,  # for example, GPT-2's vocab size
-    block_size=1024,  # maximum sequence length
-    n_layer=12,  # number of Transformer blocks
-    n_head=12,  # number of attention heads
-    n_embd=768,  # embedding dimension
+    block_size=256,  # maximum sequence length
+    n_layer=4,  # number of Transformer blocks
+    n_head=4,  # number of attention heads
+    n_embd=256,  # embedding dimension
 )
 
 # Instantiate the model
