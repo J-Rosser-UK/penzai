@@ -31,11 +31,6 @@ import jax.numpy as jnp
 
 _MAX_WAVELENGTH = 10000  # or however large you want
 
-import jax
-import jax.numpy as jnp
-
-_MAX_WAVELENGTH = 10000
-
 
 def apply_p_rope(
     inputs: jnp.ndarray,  # [..., seq_len, head_dim]
@@ -49,6 +44,9 @@ def apply_p_rope(
 
     inputs:    shape = [..., seq_len, head_dim]
     positions: shape = [..., seq_len]
+
+    For the non-rotated dimensions, an infinite wavelength is used
+    effectively leaving those dimensions unrotated, preserving their semantic information.
     """
     # How many dimensions get the rotary transform:
     rope_angles = int(rope_percentage * head_dim // 2)
@@ -155,9 +153,7 @@ class CausalSelfAttention(nn.Module):
         k = k.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
 
-        # -----------------------
         # Apply p-RoPE to Q, K
-        # -----------------------
         # 1) Flatten (B, n_head) into one batch dimension
         q_rope = q.reshape(B * self.n_head, T, head_dim)
         k_rope = k.reshape(B * self.n_head, T, head_dim)
