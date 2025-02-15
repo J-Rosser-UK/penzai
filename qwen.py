@@ -22,26 +22,6 @@ print(state_dict.keys())
 class DynamicCache(torch.nn.Module):
     """
     A cache that grows dynamically as more tokens are generated. This is the default for generative models.
-
-    It stores the Key and Value states as a list of tensors, one for each layer. The expected shape for each tensor is
-    `[batch_size, num_heads, seq_len, head_dim]`.
-
-    Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
-
-        >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
-        >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
-
-        >>> inputs = tokenizer(text="My name is Qwen2", return_tensors="pt")
-
-        >>> # Prepare a cache class and pass it to model's forward
-        >>> past_key_values = DynamicCache()
-        >>> outputs = model(**inputs, past_key_values=past_key_values, use_cache=True)
-        >>> outputs.past_key_values # access cache filled with key/values from generation
-        DynamicCache()
-        ```
     """
 
     is_compileable = False
@@ -53,33 +33,6 @@ class DynamicCache(torch.nn.Module):
         )
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
-
-    def get_usable_length(
-        self, new_seq_length: int, layer_idx: Optional[int] = 0
-    ) -> int:
-        """Given the sequence length of the new inputs, returns the usable length of the cache."""
-        # Cache without size limit -> all cache is usable
-        # Cache with size limit -> if the length cache plus the length of the new inputs is larger the maximum cache
-        #   length, we will need to evict part of the cache (and thus not all cache is usable)
-        max_length = self.get_max_cache_shape()
-        previous_seq_length = self.get_seq_length(layer_idx)
-        if max_length is not None and previous_seq_length + new_seq_length > max_length:
-            return max_length - new_seq_length
-        return previous_seq_length
-
-    def reorder_cache(self, beam_idx: torch.LongTensor):
-        """Reorders the cache for beam search, given the selected beam indices."""
-        for layer_idx in range(len(self.key_cache)):
-            if self.key_cache[layer_idx] != []:
-                device = self.key_cache[layer_idx].device
-                self.key_cache[layer_idx] = self.key_cache[layer_idx].index_select(
-                    0, beam_idx.to(device)
-                )
-            if self.value_cache[layer_idx] != []:
-                device = self.value_cache[layer_idx].device
-                self.value_cache[layer_idx] = self.value_cache[layer_idx].index_select(
-                    0, beam_idx.to(device)
-                )
 
     @property
     def seen_tokens(self):
@@ -128,19 +81,6 @@ class DynamicCache(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
-
-        Parameters:
-            key_states (`torch.Tensor`):
-                The new key states to cache.
-            value_states (`torch.Tensor`):
-                The new value states to cache.
-            layer_idx (`int`):
-                The index of the layer to cache the states for.
-            cache_kwargs (`Dict[str, Any]`, `optional`):
-                Additional arguments for the cache subclass. No additional arguments are used in `DynamicCache`.
-
-        Return:
-            A tuple containing the updated key and value states.
         """
         # Update the number of seen tokens
         if layer_idx == 0:
@@ -183,108 +123,6 @@ class DynamicCache(torch.nn.Module):
             self.key_cache[layer_idx].shape[-2] if not is_empty_layer else 0
         )
         return layer_seq_length
-
-    def get_max_cache_shape(self) -> Optional[int]:
-        """Returns the maximum sequence length of the cache object. DynamicCache does not have a maximum length."""
-        return None
-
-    def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor]]:
-        """Converts the `DynamicCache` instance into the its equivalent in the legacy cache format. Used for
-        backward compatibility."""
-        legacy_cache = ()
-        for layer_idx in range(len(self)):
-            legacy_cache += ((self.key_cache[layer_idx], self.value_cache[layer_idx]),)
-        return legacy_cache
-
-    @classmethod
-    def from_legacy_cache(
-        cls,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        num_hidden_layers: int = None,
-    ) -> "DynamicCache":
-        """Converts a cache in the legacy cache format into an equivalent `DynamicCache`. Used for
-        backward compatibility."""
-        cache = cls()
-        if past_key_values is not None:
-            for layer_idx in range(len(past_key_values)):
-                key_states, value_states = past_key_values[layer_idx]
-                cache.update(key_states, value_states, layer_idx)
-        return cache
-
-    def crop(self, max_length: int):
-        """Crop the past key values up to a new `max_length` in terms of tokens. `max_length` can also be
-        negative to remove `max_length` tokens. This is used in assisted decoding and contrastive search.
-        """
-        # In case it is negative
-        if max_length < 0:
-            max_length = self.get_seq_length() - abs(max_length)
-
-        if self.get_seq_length() <= max_length:
-            return
-
-        self._seen_tokens = max_length
-        for idx in range(len(self.key_cache)):
-            if self.key_cache[idx] != []:
-                self.key_cache[idx] = self.key_cache[idx][..., :max_length, :]
-                self.value_cache[idx] = self.value_cache[idx][..., :max_length, :]
-
-    def batch_split(
-        self, full_batch_size: int, split_size: int, num_hidden_layers: int = None
-    ) -> List["DynamicCache"]:
-        """Split the current instance into a list of `DynamicCache` by the batch size. This will be used by
-        `_split_model_inputs()` in `generation.utils`"""
-        out = []
-        for i in range(0, full_batch_size, split_size):
-            current_split = DynamicCache()
-            current_split._seen_tokens = self._seen_tokens
-            current_split.key_cache = [
-                tensor[i : i + split_size] for tensor in self.key_cache
-            ]
-            current_split.value_cache = [
-                tensor[i : i + split_size] for tensor in self.value_cache
-            ]
-            out.append(current_split)
-        return out
-
-    @classmethod
-    def from_batch_splits(
-        cls, splits: List["DynamicCache"], num_hidden_layers: int = None
-    ) -> "DynamicCache":
-        """This is the opposite of the above `batch_split()` method. This will be used by `stack_model_outputs` in
-        `generation.utils`"""
-        cache = cls()
-        for idx in range(len(splits[0])):
-            key_cache = [
-                current.key_cache[idx]
-                for current in splits
-                if current.key_cache[idx] != []
-            ]
-            value_cache = [
-                current.value_cache[idx]
-                for current in splits
-                if current.value_cache[idx] != []
-            ]
-            if key_cache != []:
-                layer_keys = torch.cat(key_cache, dim=0)
-                layer_values = torch.cat(value_cache, dim=0)
-                cache.update(layer_keys, layer_values, idx)
-        return cache
-
-    def batch_repeat_interleave(self, repeats: int):
-        """Repeat the cache `repeats` times in the batch dimension. Used in contrastive search."""
-        for layer_idx in range(len(self)):
-            self.key_cache[layer_idx] = self.key_cache[layer_idx].repeat_interleave(
-                repeats, dim=0
-            )
-            self.value_cache[layer_idx] = self.value_cache[layer_idx].repeat_interleave(
-                repeats, dim=0
-            )
-
-    def batch_select_indices(self, indices: torch.Tensor):
-        """Only keep the `indices` in the batch dimension of the cache. Used in contrastive search."""
-        for layer_idx in range(len(self)):
-            self.key_cache[layer_idx] = self.key_cache[layer_idx][indices, ...]
-            self.value_cache[layer_idx] = self.value_cache[layer_idx][indices, ...]
 
 
 class Qwen2Config:
@@ -766,16 +604,8 @@ class Qwen2RotaryEmbedding(nn.Module):
 class Qwen2PreTrainedModel(nn.Module):
     config_class = Qwen2Config
     base_model_prefix = "model"
-    supports_gradient_checkpointing = True
     _no_split_modules = ["Qwen2DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn_2 = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
-    _supports_cache_class = True
-    _supports_quantized_cache = True
-    _supports_static_cache = True
-    _supports_attention_backend = True
 
     def __init__(self, config, *inputs, **kwargs):
         super().__init__()
@@ -817,13 +647,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
         )
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2RotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
-
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.embed_tokens = value
 
     def forward(
         self,
@@ -839,40 +662,25 @@ class Qwen2Model(Qwen2PreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs,
     ) -> Union[Tuple]:
-        print("FORWARD")
-        output_attentions = False
 
-        output_hidden_states = False
+        output_attentions = False
 
         use_cache = True
 
-        return_dict = True
+        inputs_embeds = self.embed_tokens(input_ids)
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds"
-            )
+        past_key_values = DynamicCache()
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-            print("alskdfjadlfjdfjldfkj")
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
+        cache_position = torch.arange(
+            past_seen_tokens,
+            past_seen_tokens + inputs_embeds.shape[1],
+            device=inputs_embeds.device,
+        )
 
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
-            print("dynamic_cache")
-
-        if cache_position is None:
-            past_seen_tokens = (
-                past_key_values.get_seq_length() if past_key_values is not None else 0
-            )
-            cache_position = torch.arange(
-                past_seen_tokens,
-                past_seen_tokens + inputs_embeds.shape[1],
-                device=inputs_embeds.device,
-            )
-
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+        position_ids = cache_position.unsqueeze(0)
 
         causal_mask = self._update_causal_mask(
             attention_mask,
@@ -887,60 +695,25 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # decoder layers
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **flash_attn_kwargs,
-                )
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **flash_attn_kwargs,
+            )
 
             hidden_states = layer_outputs[0]
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
         hidden_states = self.norm(hidden_states)
 
-        # add hidden states from the last decoder layer
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
-        # output = BaseModelOutputWithPast(
-        #     last_hidden_state=hidden_states,
-        #     past_key_values=past_key_values if use_cache else None,
-        #     hidden_states=all_hidden_states,
-        #     attentions=all_self_attns,
-        # )
-
-        return hidden_states, past_key_values, all_hidden_states, all_self_attns
-
-        # return output if return_dict else output.to_tuple()
+        return hidden_states, past_key_values
 
     def _update_causal_mask(
         self,
@@ -1024,24 +797,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
-    def set_decoder(self, decoder):
-        self.model = decoder
-
-    def get_decoder(self):
-        return self.model
-
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1058,38 +813,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[Tuple]:
-        r"""
-        Args:
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
 
-            logits_to_keep (`int` or `torch.Tensor`, *optional*):
-                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
-                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
-                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
-                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
-                This is useful when using packed tensor format (single dimension for batch and sequence length).
-
-        Returns:
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, Qwen2ForCausalLM
-
-        >>> model = Qwen2ForCausalLM.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
-
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
         output_attentions = False
 
         output_hidden_states = False
@@ -1129,7 +853,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
                 **kwargs,
             )
 
-        return loss, logits, past_key_values, hidden_states, outputs[3]
+        return loss, logits, past_key_values, hidden_states
 
     @torch.no_grad()
     def generate(
@@ -1143,17 +867,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
     ) -> torch.LongTensor:
         """
         Generate tokens autoregressively.
-
-        Args:
-            input_ids (torch.LongTensor): Initial tokens of shape (batch_size, sequence_length).
-            max_new_tokens (int): The number of tokens to generate.
-            temperature (float, optional): Value used to module logits distribution. Defaults to 1.0.
-            do_sample (bool, optional): Whether to sample or use greedy decoding. Defaults to False.
-            top_k (int, optional): If provided, restrict sampling to the top k tokens. Defaults to None.
-            **kwargs: Additional arguments passed to the model's forward method.
-
-        Returns:
-            torch.LongTensor: The input_ids concatenated with the generated tokens.
         """
         self.eval()  # set model to evaluation mode
         generated = input_ids
@@ -1168,7 +881,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
                 input_ids_cond = input_ids_cond[:, -1:]
 
             # Forward pass (set use_cache=True to enable caching)
-            loss, logits, past, _, _ = self(
+            loss, logits, past, _ = self(
                 input_ids=input_ids_cond,
                 past_key_values=past,
                 use_cache=True,
