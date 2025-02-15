@@ -2,8 +2,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 from typing import Callable, List, Optional, Tuple, Union
-
+from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 from torch import nn
 from typing import Any, Dict
 
@@ -14,8 +15,7 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import (
     LossKwargs,
@@ -544,21 +544,7 @@ class Qwen2Attention(nn.Module):
 
         sliding_window = None
 
-        attention_interface: Callable = eager_attention_forward
-
-        if self.config._attn_implementation == "sdpa" and kwargs.get(
-            "output_attentions", False
-        ):
-            logger.warning_once(
-                "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-            )
-        else:
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation
-            ]
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = self.sdpa_attention_forward(
             self,
             query_states,
             key_states,
@@ -573,6 +559,55 @@ class Qwen2Attention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+
+    def sdpa_attention_forward(
+        self,
+        module: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        dropout: float = 0.0,
+        scaling: Optional[float] = None,
+        is_causal: Optional[bool] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, None]:
+        if hasattr(module, "num_key_value_groups"):
+            key = repeat_kv(key, module.num_key_value_groups)
+            value = repeat_kv(value, module.num_key_value_groups)
+
+        causal_mask = attention_mask
+        if attention_mask is not None:
+            causal_mask = causal_mask[:, :, :, : key.shape[-2]]
+
+        # SDPA with memory-efficient backend is bugged with non-contiguous inputs and custom attn_mask for some torch versions
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+
+        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+        if is_causal is None:
+            is_causal = causal_mask is None and query.shape[2] > 1
+
+        # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
+        # We convert it to a bool for the SDPA kernel that only accepts bools.
+        if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor):
+            is_causal = is_causal.item()
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=causal_mask,
+            dropout_p=dropout,
+            scale=scaling,
+            is_causal=is_causal,
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        return attn_output, None
 
 
 class Qwen2RMSNorm(nn.Module):
@@ -656,53 +691,70 @@ class Qwen2DecoderLayer(nn.Module):
 class Qwen2RotaryEmbedding(nn.Module):
     def __init__(self, config, device=None):
         super().__init__()
-        # BC: "rope_type" was originally "type"
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type")
-            )
-        else:
-            self.rope_type = "default"
+
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = self._compute_default_rope_parameters
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
-    def _dynamic_frequency_update(self, position_ids, device):
+    def _compute_default_rope_parameters(
+        self,
+        config: Optional[PretrainedConfig] = None,
+        device: Optional["torch.device"] = None,
+        seq_len: Optional[int] = None,
+        **rope_kwargs,
+    ) -> Tuple["torch.Tensor", float]:
         """
-        dynamic RoPE layers should recompute `inv_freq` in the following situations:
-        1 - growing beyond the cached sequence length (allow scaling)
-        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
+        Computes the inverse frequencies according to the original RoPE implementation
+        Args:
+            config ([`~transformers.PretrainedConfig`]):
+                The model configuration.
+            device (`torch.device`):
+                The device to use for initialization of the inverse frequencies.
+            seq_len (`int`, *optional*):
+                The current sequence length. Unused for this type of RoPE.
+            rope_kwargs (`Dict`, *optional*):
+                BC compatibility with the previous RoPE class instantiation, will be removed in v4.45.
+        Returns:
+            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
         """
-        seq_len = torch.max(position_ids) + 1
-        if seq_len > self.max_seq_len_cached:  # growth
-            inv_freq, self.attention_scaling = self.rope_init_fn(
-                self.config, device, seq_len=seq_len
+        if config is not None and len(rope_kwargs) > 0:
+            raise ValueError(
+                "Unexpected arguments: `**rope_kwargs` and `config` are mutually exclusive in "
+                f"`_compute_default_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
             )
-            self.register_buffer(
-                "inv_freq", inv_freq, persistent=False
-            )  # TODO joao: may break with compilation
-            self.max_seq_len_cached = seq_len
+        if len(rope_kwargs) > 0:
+            base = rope_kwargs["base"]
+            dim = rope_kwargs["dim"]
+        elif config is not None:
+            base = config.rope_theta
+            partial_rotary_factor = (
+                config.partial_rotary_factor
+                if hasattr(config, "partial_rotary_factor")
+                else 1.0
+            )
+            head_dim = getattr(
+                config, "head_dim", config.hidden_size // config.num_attention_heads
+            )
+            dim = int(head_dim * partial_rotary_factor)
 
-        if (
-            seq_len < self.original_max_seq_len
-            and self.max_seq_len_cached > self.original_max_seq_len
-        ):  # reset
-            # This .to() is needed if the model has been moved to a device after being initialized (because
-            # the buffer is automatically moved, but not the original copy)
-            self.original_inv_freq = self.original_inv_freq.to(device)
-            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
-            self.max_seq_len_cached = self.original_max_seq_len
+        attention_factor = 1.0  # Unused in this type of RoPE
+
+        # Compute the inverse frequencies
+        inv_freq = 1.0 / (
+            base
+            ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim)
+        )
+        return inv_freq, attention_factor
 
     @torch.no_grad()
     def forward(self, x, position_ids):
-        if "dynamic" in self.rope_type:
-            self._dynamic_frequency_update(position_ids, device=x.device)
 
         # Core RoPE block
         inv_freq_expanded = (
@@ -729,23 +781,6 @@ class Qwen2RotaryEmbedding(nn.Module):
         sin = sin * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-
-QWEN2_START_DOCSTRING = r"""
-    This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
-    library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
-    etc.)
-
-    This model is also a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) subclass.
-    Use it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage
-    and behavior.
-
-    Parameters:
-        config ([`Qwen2Config`]):
-            Model configuration class with all the parameters of the model. Initializing with a config file does not
-            load the weights associated with the model, only the configuration. Check out the
-            [`~PreTrainedModel.from_pretrained`] method to load the model weights.
-"""
 
 
 class Qwen2PreTrainedModel(PreTrainedModel):
@@ -988,30 +1023,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         config,
         past_key_values: DynamicCache,
     ):
-        """
-        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
-        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
 
-        Args:
-            attention_mask (`torch.Tensor`):
-                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape `(batch_size, 1, query_length, key_value_length)`.
-            sequence_length (`int`):
-                The sequence length being processed.
-            target_length (`int`):
-                The target length: when generating with static cache, the mask should be as long as the static cache, to account for the 0 padding, the part of the cache that is not filled yet.
-            dtype (`torch.dtype`):
-                The dtype to use for the 4D attention mask.
-            device (`torch.device`):
-                The device to plcae the 4D attention mask on.
-            cache_position (`torch.Tensor`):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            batch_size (`torch.Tensor`):
-                Batch size.
-            config (`Qwen2Config`):
-                The model's configuration class
-            past_key_values (`Cache`):
-                The cache class that is being used currently to generate
-        """
         if attention_mask is not None and attention_mask.dim() == 4:
             # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
             causal_mask = attention_mask
@@ -1049,7 +1061,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
-class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
+class Qwen2ForCausalLM(Qwen2PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -1180,6 +1192,79 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
 
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        do_sample: bool = False,
+        top_k: int = None,
+        **kwargs,
+    ) -> torch.LongTensor:
+        """
+        Generate tokens autoregressively.
+
+        Args:
+            input_ids (torch.LongTensor): Initial tokens of shape (batch_size, sequence_length).
+            max_new_tokens (int): The number of tokens to generate.
+            temperature (float, optional): Value used to module logits distribution. Defaults to 1.0.
+            do_sample (bool, optional): Whether to sample or use greedy decoding. Defaults to False.
+            top_k (int, optional): If provided, restrict sampling to the top k tokens. Defaults to None.
+            **kwargs: Additional arguments passed to the model's forward method.
+
+        Returns:
+            torch.LongTensor: The input_ids concatenated with the generated tokens.
+        """
+        self.eval()  # set model to evaluation mode
+        generated = input_ids
+        past = None  # cache for past key values
+
+        for _ in tqdm(range(max_new_tokens), desc="Generating tokens"):
+
+            input_ids_cond = generated
+
+            # If using past_key_values, only feed in the last token
+            if past is not None:
+                input_ids_cond = input_ids_cond[:, -1:]
+
+            # Forward pass (set use_cache=True to enable caching)
+            outputs = self(
+                input_ids=input_ids_cond,
+                past_key_values=past,
+                use_cache=True,
+                return_dict=True,
+                **kwargs,
+            )
+
+            logits = outputs.logits  # shape: (batch_size, sequence_length, vocab_size)
+            past = outputs.past_key_values  # update the cache
+
+            # Only consider the logits for the last token and scale by temperature
+            logits = logits[:, -1, :] / temperature
+
+            # Optionally restrict to top_k tokens
+            if top_k is not None:
+                top_values, _ = torch.topk(logits, top_k, dim=-1)
+                kth_value = top_values[:, -1].unsqueeze(-1)
+                logits = torch.where(
+                    logits < kth_value, torch.full_like(logits, float("-inf")), logits
+                )
+
+            # Convert logits to probabilities
+            probs = F.softmax(logits, dim=-1)
+
+            # Sample or take argmax
+            if do_sample:
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(probs, dim=-1, keepdim=True)
+
+            # Append generated token and continue
+            generated = torch.cat([generated, next_token], dim=1)
+
+        return generated
+
 
 # Assuming you have a local implementation that matches the Hugging Face architecture
 local_model = Qwen2ForCausalLM(model.config)
@@ -1207,7 +1292,8 @@ prompt = "What is 3 + 4? <think>\n"
 inputs = tokenizer(prompt, return_tensors="pt")
 
 # Generate
-generate_ids = local_model.generate(inputs.input_ids, max_length=30)
+generate_ids = local_model.generate(inputs.input_ids, max_new_tokens=30)
+print(generate_ids)
 print(
     tokenizer.batch_decode(
         generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
