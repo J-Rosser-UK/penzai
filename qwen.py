@@ -1,30 +1,12 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
+from transformers.utils import logging
 
 from typing import Callable, List, Optional, Tuple, Union
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from torch import nn
-from typing import Any, Dict
-
-
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-)
-
-from transformers.processing_utils import Unpack
-from transformers.utils import (
-    LossKwargs,
-)
-
-
-from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
-from transformers.utils import logging
-
+from typing import Any, Dict, TypedDict
 
 logger = logging.get_logger(__name__)
 
@@ -305,7 +287,7 @@ class DynamicCache(torch.nn.Module):
             self.value_cache[layer_idx] = self.value_cache[layer_idx][indices, ...]
 
 
-class Qwen2Config(PretrainedConfig):
+class Qwen2Config:
 
     model_type = "qwen2"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -376,7 +358,6 @@ class Qwen2Config(PretrainedConfig):
         # BC: if there is a 'type' field, move it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-        rope_config_validation(self)
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
@@ -520,7 +501,7 @@ class Qwen2Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[DynamicCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -652,7 +633,7 @@ class Qwen2DecoderLayer(nn.Module):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -703,7 +684,7 @@ class Qwen2RotaryEmbedding(nn.Module):
 
     def _compute_default_rope_parameters(
         self,
-        config: Optional[PretrainedConfig] = None,
+        config=None,
         device: Optional["torch.device"] = None,
         seq_len: Optional[int] = None,
         **rope_kwargs,
@@ -856,8 +837,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+        **flash_attn_kwargs,
+    ) -> Union[Tuple]:
+        print("FORWARD")
         output_attentions = False
 
         output_hidden_states = False
@@ -949,13 +931,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        output = BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=past_key_values if use_cache else None,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-        )
-        return output if return_dict else output.to_tuple()
+        # output = BaseModelOutputWithPast(
+        #     last_hidden_state=hidden_states,
+        #     past_key_values=past_key_values if use_cache else None,
+        #     hidden_states=all_hidden_states,
+        #     attentions=all_self_attns,
+        # )
+
+        return hidden_states, past_key_values, all_hidden_states, all_self_attns
+
+        # return output if return_dict else output.to_tuple()
 
     def _update_causal_mask(
         self,
@@ -1028,9 +1013,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
         return causal_mask
 
 
-class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
-
-
 class Qwen2ForCausalLM(Qwen2PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
@@ -1074,8 +1056,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[KwargsForCausalLM],
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        **kwargs,
+    ) -> Union[Tuple]:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1147,17 +1129,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
                 **kwargs,
             )
 
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
-
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+        return loss, logits, past_key_values, hidden_states, outputs[3]
 
     @torch.no_grad()
     def generate(
@@ -1196,16 +1168,13 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
                 input_ids_cond = input_ids_cond[:, -1:]
 
             # Forward pass (set use_cache=True to enable caching)
-            outputs = self(
+            loss, logits, past, _, _ = self(
                 input_ids=input_ids_cond,
                 past_key_values=past,
                 use_cache=True,
                 return_dict=True,
                 **kwargs,
             )
-
-            logits = outputs.logits  # shape: (batch_size, sequence_length, vocab_size)
-            past = outputs.past_key_values  # update the cache
 
             # Only consider the logits for the last token and scale by temperature
             logits = logits[:, -1, :] / temperature
@@ -1253,7 +1222,7 @@ hf_outputs = model(input_ids=input_ids)
 local_outputs = local_model(input_ids=input_ids)
 
 # Compare (for example, the logits)
-print(torch.allclose(hf_outputs.logits, local_outputs.logits, atol=1e-4))
+assert torch.allclose(hf_outputs.logits, local_outputs[1], atol=1e-4)
 
 prompt = "What is 3 + 4? <think>\n"
 inputs = tokenizer(prompt, return_tensors="pt")
