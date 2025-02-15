@@ -72,7 +72,7 @@ def main():
     # IMPORTANT: GPT-2 BPE has vocab_size=50257 by default.
     config = GPTConfig(
         vocab_size=50257,  # Updated for GPT-2 BPE
-        block_size=128,  # or whichever block size you used
+        block_size=256,  # or whichever block size you used
         n_layer=4,
         n_head=4,
         n_embd=256,
@@ -92,6 +92,7 @@ def main():
     prompt = "Shakespeare wrote:"
 
     # Generate
+
     completion = generate_text(
         prompt=prompt,
         tokenizer=tokenizer,

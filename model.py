@@ -28,15 +28,15 @@ from tqdm import tqdm
 
 import jax
 import jax.numpy as jnp
-
-_MAX_WAVELENGTH = 10000  # or however large you want
+from layer_norm import LayerNorm
+from functools import partial
 
 
 def apply_p_rope(
     inputs: jnp.ndarray,  # [..., seq_len, head_dim]
     positions: jnp.ndarray,  # [..., seq_len]
     head_dim: int,
-    max_wavelength: int = _MAX_WAVELENGTH,
+    max_wavelength: int = 10000,
     rope_percentage: float = 1.0,
 ) -> jnp.ndarray:
     """
@@ -96,6 +96,8 @@ class GPTConfig:
         resid_pdrop: float = 0.1,
         attn_pdrop: float = 0.1,
         model_type: Optional[str] = None,
+        rope_percentage: float = 1.0,
+        max_wavelength: int = 10000,
     ):
         self.vocab_size = vocab_size
         self.block_size = block_size
@@ -107,6 +109,9 @@ class GPTConfig:
         self.attn_pdrop = attn_pdrop
         self.model_type = model_type
 
+        self.rope_percentage = rope_percentage
+        self.max_wavelength = max_wavelength
+
 
 def new_gelu(x: jnp.ndarray) -> jnp.ndarray:
     return 0.5 * x * (1.0 + jnp.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x**3)))
@@ -114,10 +119,6 @@ def new_gelu(x: jnp.ndarray) -> jnp.ndarray:
 
 class CausalSelfAttention(nn.Module):
     config: GPTConfig
-
-    # Optional: keep rope config in GPTConfig if you want
-    # rope_percentage: float = 1.0
-    # max_wavelength: int = 10000
 
     def setup(self):
         assert self.config.n_embd % self.config.n_head == 0
@@ -135,75 +136,65 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(self.config.resid_pdrop)
         self.n_head = self.config.n_head
         self.n_embd = self.config.n_embd
-        # possibly read from config if you want rope_percentage, etc.
+
+        self.rope = partial(
+            apply_p_rope,
+            max_wavelength=self.config.max_wavelength,
+            rope_percentage=self.config.rope_percentage,
+        )
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = False) -> jnp.ndarray:
-        """
-        x: [B, T, C]
-        """
         B, T, C = x.shape
 
-        # Compute Q, K, V
+        # Calculate head dimension
+        head_dim = C // self.n_head
+
+        # QKV projection
         qkv = self.c_attn(x)  # [B, T, 3*C]
         q, k, v = jnp.split(qkv, 3, axis=-1)  # each [B, T, C]
 
-        head_dim = C // self.n_head
-        # Reshape to [B, n_head, T, head_dim]
-        q = q.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
-        k = k.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
+        # Reshape and transpose q, k, v for attention
+        def split_heads(tensor):
+            return tensor.reshape(B, T, self.n_head, head_dim).transpose(0, 2, 1, 3)
 
-        # Apply p-RoPE to Q, K
-        # 1) Flatten (B, n_head) into one batch dimension
-        q_rope = q.reshape(B * self.n_head, T, head_dim)
-        k_rope = k.reshape(B * self.n_head, T, head_dim)
+        q = split_heads(q)  # [B, nh, T, hd]
+        k = split_heads(k)  # [B, nh, T, hd]
+        v = split_heads(v)  # [B, nh, T, hd]
 
-        # 2) positions array: shape [B*n_head, T]
-        #    Here we simply repeat the [0..T-1] range for each of the B*n_head rows
-        positions = jnp.arange(T, dtype=q.dtype)[None, :].repeat(
-            B * self.n_head, axis=0
-        )
+        # Apply RoPE
+        positions = jnp.arange(T, dtype=q.dtype)
 
-        # 3) Actually call apply_p_rope
-        #    (you can parametrize rope_percentage or max_wavelength from config)
-        q_roped = apply_p_rope(
-            inputs=q_rope,
-            positions=positions,
-            head_dim=head_dim,
-            max_wavelength=10000,  # or from config
-            rope_percentage=1.0,  # or from config
-        )
-        k_roped = apply_p_rope(
-            inputs=k_rope,
-            positions=positions,
-            head_dim=head_dim,
-            max_wavelength=10000,
-            rope_percentage=1.0,
-        )
+        # Reshape for RoPE
+        q_rope = q.reshape(-1, T, head_dim)  # [B*nh, T, hd]
+        k_rope = k.reshape(-1, T, head_dim)  # [B*nh, T, hd]
 
-        # 4) Reshape back to [B, n_head, T, head_dim]
-        q = q_roped.reshape(B, self.n_head, T, head_dim)
-        k = k_roped.reshape(B, self.n_head, T, head_dim)
+        # Apply RoPE and reshape back
+        q = self.rope(q_rope, positions, head_dim).reshape(B, self.n_head, T, head_dim)
+        k = self.rope(k_rope, positions, head_dim).reshape(B, self.n_head, T, head_dim)
 
-        # Perform attention: dot product q·k
-        att = jnp.einsum("bhqd,bhkd->bhqk", q, k)
-        att = att * (1.0 / jnp.sqrt(k.shape[-1]))
+        # Scaled dot-product attention
+        scale = jnp.sqrt(head_dim).astype(k.dtype)
+        attention = (q @ k.transpose(0, 1, 3, 2)) / scale  # [B, nh, T, T]
 
         # Causal mask
-        causal_mask = jnp.tril(jnp.ones((T, T), dtype=bool))
-        mask_value = jnp.finfo(att.dtype).min
-        att = jnp.where(causal_mask, att, mask_value)
+        causal_mask = jnp.tril(jnp.ones((T, T))).astype(bool)
+        mask_value = jnp.finfo(attention.dtype).min
+        attention = jnp.where(causal_mask, attention, mask_value)
 
-        att = nn.softmax(att, axis=-1)
-        att = self.attn_dropout(att, deterministic=deterministic)
+        # Softmax and dropout
+        attention = nn.softmax(attention, axis=-1)
+        attention = self.attn_dropout(attention, deterministic=deterministic)
 
-        # Output
-        y = jnp.einsum("bhqk,bhkd->bhqd", att, v)
-        # [B, n_head, T, head_dim] -> [B, T, n_head, head_dim] -> [B, T, C]
+        # Attention output
+        y = attention @ v  # [B, nh, T, hd]
+
+        # Reshape back to [B, T, C]
         y = y.transpose(0, 2, 1, 3).reshape(B, T, C)
 
+        # Output projection
         y = self.c_proj(y)
         y = self.resid_dropout(y, deterministic=deterministic)
+
         return y
 
 
@@ -231,14 +222,17 @@ class Block(nn.Module):
     config: GPTConfig
 
     def setup(self):
-        self.ln_1 = nn.LayerNorm(epsilon=1e-5)
+        self.ln_1 = LayerNorm(features=self.config.n_embd, epsilon=1e-5)
         self.attn = CausalSelfAttention(self.config)
-        self.ln_2 = nn.LayerNorm(epsilon=1e-5)
+        self.ln_2 = LayerNorm(features=self.config.n_embd, epsilon=1e-5)
         self.mlp = MLP(self.config)
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = False) -> jnp.ndarray:
-        x = x + self.attn(self.ln_1(x), deterministic=deterministic)
-        x = x + self.mlp(self.ln_2(x), deterministic=deterministic)
+
+        ln_1_out, _ = self.ln_1(x)
+        ln_2_out, _ = self.ln_2(x)
+        x = x + self.attn(ln_1_out, deterministic=deterministic)
+        x = x + self.mlp(ln_2_out, deterministic=deterministic)
         return x
 
 
@@ -253,14 +247,9 @@ class GPT(nn.Module):
             features=self.config.n_embd,
             embedding_init=initializers.normal(stddev=0.02),
         )
-        # self.wpe = nn.Embed(
-        #     num_embeddings=self.config.block_size,
-        #     features=self.config.n_embd,
-        #     embedding_init=initializers.normal(stddev=0.02),
-        # )
         self.drop = nn.Dropout(self.config.embd_pdrop)
         self.h = [Block(self.config) for _ in range(self.config.n_layer)]
-        self.ln_f = nn.LayerNorm(epsilon=1e-5)
+        self.ln_f = LayerNorm(features=self.config.n_embd, epsilon=1e-5)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             use_bias=False,
@@ -290,7 +279,7 @@ class GPT(nn.Module):
         for block in self.h:
             x = block(x, deterministic=deterministic)
 
-        x = self.ln_f(x)
+        x, _ = self.ln_f(x)
         logits = self.lm_head(x)
 
         # optional loss

@@ -12,8 +12,6 @@ On the whole, I felt like Penzai was much "closer" to the actual model than Tran
 
 
 
-
-
 | Feature | Penzai | TransformerLens|
 |--------------------------|--------------------------|--------------------------|
 | Supported frameworks? | `flax.linen` and `penzai` | `torch` inside `transformer-lens` |
