@@ -179,10 +179,6 @@ class Qwen2Config:
         )
 
 
-_CHECKPOINT_FOR_DOC = "meta-qwen2/Qwen2-2-7b-hf"
-_CONFIG_FOR_DOC = "Qwen2Config"
-
-
 class Qwen2MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -197,84 +193,6 @@ class Qwen2MLP(nn.Module):
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`, *optional*):
-            Deprecated and unused.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-        query.dtype
-    )
-    attn_weights = nn.functional.dropout(
-        attn_weights, p=dropout, training=module.training
-    )
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
 
 
 class Qwen2Attention(nn.Module):
@@ -323,7 +241,7 @@ class Qwen2Attention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
+        query_states, key_states = self.apply_rotary_pos_emb(
             query_states, key_states, cos, sin
         )
 
@@ -365,8 +283,8 @@ class Qwen2Attention(nn.Module):
         **kwargs,
     ) -> Tuple[torch.Tensor, None]:
         if hasattr(module, "num_key_value_groups"):
-            key = repeat_kv(key, module.num_key_value_groups)
-            value = repeat_kv(value, module.num_key_value_groups)
+            key = self.repeat_kv(key, module.num_key_value_groups)
+            value = self.repeat_kv(value, module.num_key_value_groups)
 
         causal_mask = attention_mask
         if attention_mask is not None:
@@ -400,6 +318,51 @@ class Qwen2Attention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous()
 
         return attn_output, None
+
+    def rotate_half(self, x):
+        """Rotates half the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(self, q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+        """Applies Rotary Position Embedding to the query and key tensors.
+
+        Args:
+            q (`torch.Tensor`): The query tensor.
+            k (`torch.Tensor`): The key tensor.
+            cos (`torch.Tensor`): The cosine part of the rotary embedding.
+            sin (`torch.Tensor`): The sine part of the rotary embedding.
+            position_ids (`torch.Tensor`, *optional*):
+                Deprecated and unused.
+            unsqueeze_dim (`int`, *optional*, defaults to 1):
+                The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+                sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+                that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+                k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+                cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+                the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+        Returns:
+            `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+        """
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+        q_embed = (q * cos) + (self.rotate_half(q) * sin)
+        k_embed = (k * cos) + (self.rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    def repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+        num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+        """
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, None, :, :].expand(
+            batch, num_key_value_heads, n_rep, slen, head_dim
+        )
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 class Qwen2RMSNorm(nn.Module):
@@ -575,29 +538,7 @@ class Qwen2RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-class Qwen2PreTrainedModel(nn.Module):
-    config_class = Qwen2Config
-    base_model_prefix = "model"
-    _no_split_modules = ["Qwen2DecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-
-    def __init__(self, config, *inputs, **kwargs):
-        super().__init__()
-        self.config = config
-
-    def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-
-
-class Qwen2Model(Qwen2PreTrainedModel):
+class Qwen2Model(nn.Module):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`Qwen2DecoderLayer`]
 
@@ -605,8 +546,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
         config
     """
 
+    config_class = Qwen2Config
+    base_model_prefix = "model"
+    _no_split_modules = ["Qwen2DecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+
     def __init__(self, config):
-        super().__init__(config)
+        super().__init__()
+        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -760,13 +707,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
         return causal_mask
 
 
-class Qwen2ForCausalLM(Qwen2PreTrainedModel):
+class Qwen2ForCausalLM(nn.Module):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
-        super().__init__(config)
+        super().__init__()
+        self.config = config
         self.model = Qwen2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
