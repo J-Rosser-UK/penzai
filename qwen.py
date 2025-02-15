@@ -1,22 +1,9 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.utils import logging
-
 from typing import Callable, List, Optional, Tuple, Union
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from torch import nn
 from typing import Any, Dict, TypedDict
-
-logger = logging.get_logger(__name__)
-
-model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name)
-
-state_dict = model.state_dict()
-print(state_dict.keys())
 
 
 class DynamicCache(torch.nn.Module):
@@ -33,17 +20,6 @@ class DynamicCache(torch.nn.Module):
         )
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
-
-    @property
-    def seen_tokens(self):
-        logger.warning_once(
-            "The `seen_tokens` attribute is deprecated and will be removed in v4.41. Use the `cache_position` "
-            "model input instead."
-        )
-        if hasattr(self, "_seen_tokens"):
-            return self._seen_tokens
-        else:
-            return None
 
     def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
         """
@@ -202,8 +178,6 @@ class Qwen2Config:
             **kwargs,
         )
 
-
-logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "meta-qwen2/Qwen2-2-7b-hf"
 _CONFIG_FOR_DOC = "Qwen2Config"
@@ -913,6 +887,18 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             generated = torch.cat([generated, next_token], dim=1)
 
         return generated
+
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(model_name)
+
+state_dict = model.state_dict()
+print(state_dict.keys())
 
 
 # Assuming you have a local implementation that matches the Hugging Face architecture
