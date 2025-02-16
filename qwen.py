@@ -4,9 +4,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from typing import Any, Dict, TypedDict
+from rich import print
 
 
-class DynamicCache(torch.nn.Module):
+class DynamicCache(nn.Module):
     """
     A cache that grows dynamically as more tokens are generated. This is the default for generative models.
     """
@@ -847,6 +848,7 @@ model = AutoModelForCausalLM.from_pretrained(model_name)
 
 state_dict = model.state_dict()
 print(state_dict.keys())
+print(model)
 
 
 # Assuming you have a local implementation that matches the Hugging Face architecture

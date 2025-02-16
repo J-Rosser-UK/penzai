@@ -55,9 +55,9 @@ cover/
 *wiki.txt
 # Translations
 *.mo
-*.pot
+*.bin
 *notebooks/
-
+*.bin
 # Django stuff:
 *.log
 local_settings.py
