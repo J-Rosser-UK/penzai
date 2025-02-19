@@ -11,9 +11,6 @@ Normally my code is much cleaner and with unittests!
 On the whole, I felt like Penzai was much "closer" to the actual model than TransformerLens, operating directly on the Jax PyTree and supporting jitting and sharding. One drawback is that when you `unflaxify` a model, you lose all the methods that run on it e.g. `model.generate` so the `unflaxified` model is really cemented as a duplicate for inspecting. Equally, treescope doesn't work as well on `unflaxified` models compared to ones natively built in Penzai, wrapping every layer in `InterceptedFlaxModuleMethod`.
 
 
-
-
-
 | Feature | Penzai | TransformerLens|
 |--------------------------|--------------------------|--------------------------|
 | Supported frameworks? | `flax.linen` and `penzai` | `torch` inside `transformer-lens` |
@@ -24,6 +21,12 @@ On the whole, I felt like Penzai was much "closer" to the actual model than Tran
 |Hooks | Use `Selector` to assign hooks directly on the JAX PyTree then run forward pass as normal | `model.run_with_hooks` has to be explictly called|
 |Generate functionality | Lost when `unflaxify` is called. | `model.generate` for basic text generation|
 |Bonus Features | `NamedArray` and the `copy and paste` functionality of treescope` | Easy cache all activations|
+
+
+### Suggested Improvements
+- Unify array types between `InterceptedFlaxModuleMethod` and `Layer` - currently it's challenging to patch unflaxified models for training
+- Better visualizations for `InterceptedFlaxModuleMethod`
+- Bind the methods to the unflaxifies model rather than requiring `@nn.nowrap` everywhere.
 
 # Colab for running training sharded across TPUs
 https://colab.research.google.com/drive/1oZ5_KPPOqHP4wLQLYuvI_nO36TCV6Hfv#scrollTo=llETZKq21sd2
